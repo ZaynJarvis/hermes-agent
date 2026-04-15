@@ -28,7 +28,6 @@ Usage in run_agent.py:
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 from typing import Any, Dict, List, Optional
@@ -279,6 +278,27 @@ class MemoryManager:
             except Exception as e:
                 logger.debug(
                     "Memory provider '%s' on_session_end failed: %s",
+                    provider.name, e,
+                )
+
+    def restart_session(self, new_session_id: str) -> None:
+        """Transition external providers to a new session without full teardown.
+
+        Called by /new AFTER on_session_end() has committed the old session.
+        Providers that implement reset_session() are transitioned cheaply;
+        others fall back to a full initialize().
+        """
+        for provider in self._providers:
+            if provider.name == "builtin":
+                continue
+            try:
+                if hasattr(provider, "reset_session"):
+                    provider.reset_session(new_session_id)
+                else:
+                    provider.initialize(session_id=new_session_id)
+            except Exception as e:
+                logger.debug(
+                    "Memory provider '%s' restart_session failed: %s",
                     provider.name, e,
                 )
 
