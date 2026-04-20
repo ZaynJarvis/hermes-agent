@@ -146,17 +146,12 @@ SEARCH_SCHEMA = {
     "description": (
         "Semantic search over the OpenViking knowledge base. "
         "Returns ranked results with viking:// URIs for deeper reading. "
-        "Use mode='deep' for complex queries that need reasoning across "
-        "multiple sources, 'fast' for simple lookups."
+        "Uses context-aware search with session history for better results."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "Search query."},
-            "mode": {
-                "type": "string", "enum": ["auto", "fast", "deep"],
-                "description": "Search depth (default: auto).",
-            },
             "scope": {
                 "type": "string",
                 "description": "Viking URI prefix to scope search (e.g. 'viking://resources/docs/').",
@@ -251,6 +246,51 @@ ADD_RESOURCE_SCHEMA = {
             },
         },
         "required": ["url"],
+    },
+}
+
+GREP_SCHEMA = {
+    "name": "viking_grep",
+    "description": (
+        "Search content by regex pattern across the OpenViking knowledge base. "
+        "Useful for finding specific strings, code patterns, or identifiers."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "uri": {
+                "type": "string",
+                "description": "Viking URI to search in (e.g. 'viking://resources/').",
+            },
+            "pattern": {"type": "string", "description": "Regex pattern to search for."},
+            "case_insensitive": {
+                "type": "boolean",
+                "description": "Ignore case (default: false).",
+            },
+        },
+        "required": ["uri", "pattern"],
+    },
+}
+
+GLOB_SCHEMA = {
+    "name": "viking_glob",
+    "description": (
+        "Find files by glob pattern in the OpenViking knowledge base. "
+        "Useful for discovering files by extension or name pattern."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "pattern": {
+                "type": "string",
+                "description": "Glob pattern (e.g. '**/*.md', '**/*.py').",
+            },
+            "uri": {
+                "type": "string",
+                "description": "Starting URI (default: 'viking://').",
+            },
+        },
+        "required": ["pattern"],
     },
 }
 
@@ -372,7 +412,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 client = _VikingClient(self._endpoint, self._api_key)
                 resp = client.post("/api/v1/search/find", {
                     "query": query,
-                    "top_k": 5,
+                    "limit": 5,
                 })
                 result = resp.get("result", {})
                 parts = []
@@ -476,7 +516,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
         t.start()
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return [SEARCH_SCHEMA, READ_SCHEMA, BROWSE_SCHEMA, REMEMBER_SCHEMA, ADD_RESOURCE_SCHEMA]
+        return [SEARCH_SCHEMA, READ_SCHEMA, BROWSE_SCHEMA, REMEMBER_SCHEMA,
+                ADD_RESOURCE_SCHEMA, GREP_SCHEMA, GLOB_SCHEMA]
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         if not self._client:
@@ -493,6 +534,10 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 return self._tool_remember(args)
             elif tool_name == "viking_add_resource":
                 return self._tool_add_resource(args)
+            elif tool_name == "viking_grep":
+                return self._tool_grep(args)
+            elif tool_name == "viking_glob":
+                return self._tool_glob(args)
             return tool_error(f"Unknown tool: {tool_name}")
         except Exception as e:
             return tool_error(str(e))
@@ -507,6 +552,20 @@ class OpenVikingMemoryProvider(MemoryProvider):
         if _last_active_provider is self:
             _last_active_provider = None
 
+    # -- Helpers -------------------------------------------------------------
+
+    def _track_used(self, uris: List[str]) -> None:
+        """Record actually-used context URIs so commit can update active_count."""
+        if not self._client or not self._session_id or not uris:
+            return
+        try:
+            self._client.post(
+                f"/api/v1/sessions/{self._session_id}/used",
+                {"contexts": uris},
+            )
+        except Exception as e:
+            logger.debug("OpenViking used() tracking failed: %s", e)
+
     # -- Tool implementations ------------------------------------------------
 
     def _tool_search(self, args: dict) -> str:
@@ -515,15 +574,23 @@ class OpenVikingMemoryProvider(MemoryProvider):
             return tool_error("query is required")
 
         payload: Dict[str, Any] = {"query": query}
-        mode = args.get("mode", "auto")
-        if mode != "auto":
-            payload["mode"] = mode
         if args.get("scope"):
             payload["target_uri"] = args["scope"]
         if args.get("limit"):
-            payload["top_k"] = args["limit"]
+            payload["limit"] = args["limit"]
 
-        resp = self._client.post("/api/v1/search/find", payload)
+        # Use context-aware search when we have a session, fall back to
+        # basic find otherwise.
+        if self._session_id:
+            payload["session_id"] = self._session_id
+            resp = self._client.post("/api/v1/search/search", payload)
+        else:
+            resp = self._client.post("/api/v1/search/find", payload)
+
+        if resp.get("status") != "ok":
+            error = resp.get("error", resp.get("detail", "Unknown error"))
+            return tool_error(f"Search failed: {error}")
+
         result = resp.get("result", {})
 
         # Format results for the model — keep it concise
@@ -560,9 +627,17 @@ class OpenVikingMemoryProvider(MemoryProvider):
         else:  # overview
             resp = self._client.get("/api/v1/content/overview", params={"uri": uri})
 
+        if resp.get("status") != "ok":
+            error = resp.get("error", resp.get("detail", "Unknown error"))
+            return tool_error(f"Read failed: {error}")
+
         result = resp.get("result", "")
         # result is a plain string from the content endpoints
         content = result if isinstance(result, str) else result.get("content", "")
+
+        # Track that this context was actually used (improves future retrieval)
+        if self._session_id and level in ("overview", "full"):
+            self._track_used([uri])
 
         # Truncate very long content to avoid flooding the context
         if len(content) > 8000:
@@ -582,6 +657,11 @@ class OpenVikingMemoryProvider(MemoryProvider):
         endpoint_map = {"tree": "/api/v1/fs/tree", "list": "/api/v1/fs/ls", "stat": "/api/v1/fs/stat"}
         endpoint = endpoint_map.get(action, "/api/v1/fs/ls")
         resp = self._client.get(endpoint, params={"uri": path})
+
+        if resp.get("status") != "ok":
+            error = resp.get("error", resp.get("detail", "Unknown error"))
+            return tool_error(f"Browse failed: {error}")
+
         result = resp.get("result", {})
 
         # Format list/tree results for readability
@@ -632,12 +712,71 @@ class OpenVikingMemoryProvider(MemoryProvider):
             payload["reason"] = args["reason"]
 
         resp = self._client.post("/api/v1/resources", payload)
+
+        if resp.get("status") != "ok":
+            error = resp.get("error", resp.get("detail", "Unknown error"))
+            return tool_error(f"Add resource failed: {error}")
+
         result = resp.get("result", {})
 
         return json.dumps({
             "status": "added",
             "root_uri": result.get("root_uri", ""),
             "message": "Resource queued for processing. Use viking_search after a moment to find it.",
+        }, ensure_ascii=False)
+
+    def _tool_grep(self, args: dict) -> str:
+        uri = args.get("uri", "")
+        pattern = args.get("pattern", "")
+        if not uri or not pattern:
+            return tool_error("uri and pattern are required")
+
+        payload: Dict[str, Any] = {"uri": uri, "pattern": pattern}
+        if args.get("case_insensitive"):
+            payload["case_insensitive"] = True
+
+        resp = self._client.post("/api/v1/search/grep", payload)
+
+        if resp.get("status") != "ok":
+            error = resp.get("error", resp.get("detail", "Unknown error"))
+            return tool_error(f"Grep failed: {error}")
+
+        result = resp.get("result", {})
+        matches = result.get("matches", [])
+
+        formatted = []
+        for m in matches[:30]:
+            formatted.append({
+                "uri": m.get("uri", ""),
+                "line": m.get("line", 0),
+                "content": m.get("content", ""),
+            })
+
+        return json.dumps({
+            "matches": formatted,
+            "count": result.get("count", len(formatted)),
+        }, ensure_ascii=False)
+
+    def _tool_glob(self, args: dict) -> str:
+        pattern = args.get("pattern", "")
+        if not pattern:
+            return tool_error("pattern is required")
+
+        payload: Dict[str, Any] = {"pattern": pattern}
+        if args.get("uri"):
+            payload["uri"] = args["uri"]
+
+        resp = self._client.post("/api/v1/search/glob", payload)
+
+        if resp.get("status") != "ok":
+            error = resp.get("error", resp.get("detail", "Unknown error"))
+            return tool_error(f"Glob failed: {error}")
+
+        result = resp.get("result", {})
+
+        return json.dumps({
+            "matches": result.get("matches", [])[:50],
+            "count": result.get("count", 0),
         }, ensure_ascii=False)
 
 
